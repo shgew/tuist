@@ -25,6 +25,11 @@ timestamp finding requires the cited changed line to contain
 `timestamps()` without `type: :timestamptz` or a timestamp column without
 `:timestamptz`.
 
+Before flagging an N+1 query or naming issue, **quote the exact line
+content from the diff to self-verify** — hallucinated patterns (e.g.
+`Repo.get_by` that doesn't exist, table names not in the file) must not
+be reported.
+
 ---
 
 ## 1. Authorization — `lib/tuist/authorization.ex` + `AuthorizationPlug`
@@ -45,6 +50,7 @@ hard-codes which categories are project-scoped:
 - **`:public_project` or `[:authenticated_as_user, :ops_access]` allowed for `:create`, `:update`, or `:delete` actions.** These flags are intended for read-only paths.
 - **A new `action :read | :create | :update | :delete` that doesn't cover all three subject kinds** (`:authenticated_as_user`, `:authenticated_as_project`, `:authenticated_as_account` with a `scopes_permit:` check) **without an inline `desc(...)` explaining the omission.** Missing one is usually a bug; an explicit `desc` is the documented escape hatch.
 - **An account-token `allow` without a `scopes_permit:` check** (e.g. bare `[:authenticated_as_account]`). Account tokens must always be scope-gated.
+- **A new authenticated pipeline (e.g., `:scim_api`, `:mcp_api`) without a rate-limit plug.** Check existing pipelines like `:api` for the rate-limit pattern; new authenticated endpoints should follow suit to prevent abuse. **Severity: medium.**
 
 ### Do not flag
 
@@ -214,7 +220,7 @@ In marketing copy and pricing UI:
 ## 9. N+1 queries — DB calls inside loops
 
 A `Repo.*` / `ClickHouseRepo.*` / `IngestRepo.*` call inside `Enum.map`,
-`Enum.each`, `Enum.flat_map`, `Enum.filter`, `Enum.reduce`, `for`, or
+`Enum.each`, `Enum.flat_map`, `Enum.reduce`, `for`, or
 `Stream.*` is almost always an N+1. Each iteration is a separate round
 trip; the chart-bucket loop or per-row preload that looked harmless on
 toy data stalls real page loads.
@@ -234,6 +240,9 @@ toy data stalls real page loads.
 The repos to watch: `Tuist.Repo`, `Tuist.ClickHouseRepo`,
 `Tuist.IngestRepo`, plus any aliased form (e.g. `alias Tuist.Repo`,
 then bare `Repo.*` inside the loop).
+
+**Before flagging, self-verify by quoting the exact line from the diff.**
+Do not hallucinate patterns (e.g., `Repo.get_by` that doesn't exist).
 
 ### Flag (Severity: medium; high if hot path)
 
@@ -270,6 +279,8 @@ author can act on it directly:
   the cursor-based stream (e.g. "stream so we don't load 10M rows").
 - Pre-existing N+1s untouched by the diff — this skill is for new
   regressions, not codebase-wide audits.
+- **False patterns** — if you cannot quote the exact line from the diff,
+  do not flag it.
 
 ---
 
@@ -312,6 +323,70 @@ When suggesting a fix:
 
 ---
 
+## 11. Token security — signing vs encryption
+
+Phoenix tokens come in two flavors with different security properties:
+
+- **`Phoenix.Token.sign/4`** — produces a signed but **readable** token.
+  The payload is Base64-encoded, not encrypted. Anyone with the token
+  can decode and read the contents.
+- **`Phoenix.Token.encrypt/4`** — produces an encrypted token. The
+  payload is encrypted with the secret key; without the key, the
+  contents are opaque.
+
+### Flag (Severity: high)
+
+- **Use of `Phoenix.Token.sign/4` when the payload contains secrets**
+  (webhook URLs, API keys, credentials, internal identifiers that
+  should not be visible to clients). The token is rendered into HTML
+  or sent to the client where it can be decoded and inspected.
+  Use `Phoenix.Token.encrypt/4` instead.
+- **`Phoenix.Token.decrypt/4` result not handling `{:error, reason}`**
+  when the decrypted value is passed to external systems.
+
+### Do not flag
+
+- `sign/4` for public metadata (user IDs, timestamps, non-sensitive
+  flags) that the client is allowed to see.
+- Encrypted tokens (`encrypt/4`) used for their intended purpose.
+
+---
+
+## 12. Transaction boundaries for multi-step operations
+
+Functions that perform multiple database writes in sequence (create,
+update, delete across related tables) can leave the system in an
+inconsistent state if they crash or the DB rejects a later operation.
+
+### Flag (Severity: medium)
+
+- **Multiple independent `Repo.insert/2`, `Repo.update/2`, or
+  `Repo.delete/2` calls in a single function** that form a logical
+  unit but aren't wrapped in `Repo.transaction/1` or `Ecto.Multi`.
+  This is especially important for provisioning flows (user creation
+  + org membership + token generation) where partial failure leaves
+  orphaned rows.
+
+When suggesting a fix, recommend `Ecto.Multi` for clarity:
+
+```elixir
+Ecto.Multi.new()
+|> Ecto.Multi.insert(:user, User.changeset(%User{}, attrs))
+|> Ecto.Multi.run(:membership, fn _repo, %{user: user} ->
+  Accounts.add_user_to_organization(user, organization, role: role)
+end)
+|> Repo.transaction()
+```
+
+### Do not flag
+
+- Single insert/update/delete operations.
+- Operations that are intentionally best-effort (e.g., logging,
+  analytics writes) where partial failure is acceptable.
+- Operations already wrapped in `Repo.transaction/1` or `Ecto.Multi`.
+
+---
+
 ## Out of scope (handled elsewhere — do not flag)
 
 - Module / function naming, pipe-chain start, function ordering,
@@ -327,10 +402,11 @@ When suggesting a fix:
 For each finding, confirm:
 
 1. The `path:line` is real and the snippet appears in the diff.
-2. The category above is one of 1–10; if it isn't, downgrade to a
+2. **You have quoted the exact line content** — no hallucinations.
+3. The category above is one of 1–12; if it isn't, downgrade to a
    question (`uncertain: ...`) rather than asserting a finding.
-3. The severity is set: **critical** (auth bypass / cross-tenant read or
+4. The severity is set: **critical** (auth bypass / cross-tenant read or
    write), **high** (likely security or correctness bug), **medium**
    (compliance / consistency gap), **low** (nice-to-have).
-4. You are not reporting an unchanged line as a finding. Unchanged
+5. You are not reporting an unchanged line as a finding. Unchanged
    context can explain a diff finding, but cannot be the finding itself.
