@@ -63,6 +63,7 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
     private let contentHasher: ContentHashing
     private let swiftPackageManagerLock: SwiftPackageManagerLock
     private let swiftPackageManagerScratchDirectoryLocator: SwiftPackageManagerScratchDirectoryLocator
+    private let environment: () -> [String: String]
 
     public init(
         swiftPackageManagerController: SwiftPackageManagerControlling = SwiftPackageManagerController(),
@@ -72,7 +73,8 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
         contentHasher: ContentHashing = ContentHasher(),
         swiftPackageManagerLock: SwiftPackageManagerLock = SwiftPackageManagerLock(),
         swiftPackageManagerScratchDirectoryLocator: SwiftPackageManagerScratchDirectoryLocator =
-            SwiftPackageManagerScratchDirectoryLocator()
+            SwiftPackageManagerScratchDirectoryLocator(),
+        environment: @escaping () -> [String: String] = { Environment.current.variables }
     ) {
         self.swiftPackageManagerController = swiftPackageManagerController
         self.packageInfoMapper = packageInfoMapper
@@ -81,6 +83,7 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
         self.contentHasher = contentHasher
         self.swiftPackageManagerLock = swiftPackageManagerLock
         self.swiftPackageManagerScratchDirectoryLocator = swiftPackageManagerScratchDirectoryLocator
+        self.environment = environment
     }
 
     public func load(
@@ -117,7 +120,8 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
             disableSandbox: disableSandbox,
             scratchDirectory: scratchDirectory,
             workspaceState: workspaceState,
-            outdatedDependencyIssues: outdatedDependencyIssues
+            outdatedDependencyIssues: outdatedDependencyIssues,
+            swiftPackageManagerArguments: swiftPackageManagerArguments
         )
     }
 
@@ -128,12 +132,23 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
         disableSandbox: Bool,
         scratchDirectory: AbsolutePath,
         workspaceState: SwiftPackageManagerWorkspaceState,
-        outdatedDependencyIssues: [LintingIssue]
+        outdatedDependencyIssues: [LintingIssue],
+        swiftPackageManagerArguments: [String]
     ) async throws -> (TuistLoader.DependenciesGraph, [LintingIssue]) {
         let path = scratchDirectory
         let checkoutsFolder = path.appending(component: "checkouts")
+        let swifterPMPackageInfoCache = try await swifterPMPackageInfoCache(
+            scratchDirectory: scratchDirectory,
+            arguments: swiftPackageManagerArguments
+        )
 
-        let rootPackage = try await manifestLoader.loadPackage(at: packagePath.parentDirectory, disableSandbox: disableSandbox)
+        let rootPackage = if let swifterPMPackageInfoCache {
+            try await loadCachedPackageInfo(
+                at: swifterPMPackageInfoCache.root.packageInfoPath
+            )
+        } else {
+            try await manifestLoader.loadPackage(at: packagePath.parentDirectory, disableSandbox: disableSandbox)
+        }
 
         var packageInfos: [
             // swiftlint:disable:next large_tuple
@@ -174,7 +189,14 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
                 throw SwiftPackageManagerGraphGeneratorError.unsupportedDependencyKind(dependency.packageRef.kind)
             }
 
-            let packageInfo = try await manifestLoader.loadPackage(at: packageFolder, disableSandbox: disableSandbox)
+            let packageInfo = if let cachedPackageInfo = try await cachedPackageInfo(
+                for: dependency,
+                in: swifterPMPackageInfoCache
+            ) {
+                cachedPackageInfo
+            } else {
+                try await manifestLoader.loadPackage(at: packageFolder, disableSandbox: disableSandbox)
+            }
             let targetToArtifactPaths = try workspaceState.object.artifacts
                 .filter { $0.packageRef.identity == dependency.packageRef.identity }
                 .reduce(into: [:]) { result, artifact in
@@ -420,9 +442,83 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
         try swiftPackageManagerScratchDirectoryLocator.locate(
             packagePath: packagePath,
             arguments: arguments,
-            environment: Environment.current.variables,
+            environment: environment(),
             workingDirectory: try await Environment.current.currentWorkingDirectory()
         )
+    }
+
+    private func swifterPMPackageInfoCache(
+        scratchDirectory: AbsolutePath,
+        arguments: [String]
+    ) async throws -> SwifterPMPackageInfoCache? {
+        guard isTruthy(environment()[Constants.EnvironmentVariables.useFastPackageResolution]) else {
+            return nil
+        }
+
+        let cacheDirectory = try swifterPMPackageInfoCacheDirectory(
+            scratchDirectory: scratchDirectory,
+            arguments: arguments
+        )
+        let indexPath = cacheDirectory.appending(component: "index.json")
+        guard try await fileSystem.exists(indexPath) else {
+            return nil
+        }
+
+        return try JSONDecoder().decode(
+            SwifterPMPackageInfoCache.self,
+            from: try await fileSystem.readFile(at: indexPath)
+        )
+    }
+
+    private func swifterPMPackageInfoCacheDirectory(
+        scratchDirectory: AbsolutePath,
+        arguments: [String]
+    ) throws -> AbsolutePath {
+        if let cachePath = argumentValue(for: "--package-info-cache-path", in: arguments) {
+            return try AbsolutePath(validating: cachePath)
+        }
+
+        return scratchDirectory.appending(components: [
+            "swifterpm",
+            "package-info",
+        ])
+    }
+
+    private func argumentValue(for argument: String, in arguments: [String]) -> String? {
+        guard let argumentIndex = arguments.firstIndex(of: argument) else {
+            return nil
+        }
+        let valueIndex = arguments.index(after: argumentIndex)
+        guard arguments.indices.contains(valueIndex) else {
+            return nil
+        }
+        return arguments[valueIndex]
+    }
+
+    private func cachedPackageInfo(
+        for dependency: SwiftPackageManagerWorkspaceState.Dependency,
+        in cache: SwifterPMPackageInfoCache?
+    ) async throws -> PackageInfo? {
+        guard let cache else { return nil }
+
+        let identity = dependency.packageRef.identity.lowercased()
+        guard let entry = cache.packages.first(where: { $0.identity.lowercased() == identity }) else {
+            return nil
+        }
+
+        return try await loadCachedPackageInfo(at: entry.packageInfoPath)
+    }
+
+    private func loadCachedPackageInfo(at path: String) async throws -> PackageInfo {
+        try JSONDecoder().decode(
+            PackageInfo.self,
+            from: try await fileSystem.readFile(at: try AbsolutePath(validating: path))
+        )
+    }
+
+    private func isTruthy(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return ["1", "true", "TRUE", "yes", "YES"].contains(value)
     }
 
     private func validatePackageResolved(
@@ -456,6 +552,16 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
             )]
         }
         return []
+    }
+}
+
+private struct SwifterPMPackageInfoCache: Decodable {
+    let root: Entry
+    let packages: [Entry]
+
+    struct Entry: Decodable {
+        let identity: String
+        let packageInfoPath: String
     }
 }
 
