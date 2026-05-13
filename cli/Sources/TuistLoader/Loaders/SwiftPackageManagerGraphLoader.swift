@@ -64,7 +64,7 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
     private let swiftPackageManagerLock: SwiftPackageManagerLock
     private let swiftPackageManagerScratchDirectoryLocator: SwiftPackageManagerScratchDirectoryLocator
     private let packageResolvedValidator: PackageResolvedValidator
-    private let environment: () -> [String: String]
+    private let environment: () -> Environmenting
 
     public init(
         swiftPackageManagerController: SwiftPackageManagerControlling = SwiftPackageManagerController(),
@@ -75,7 +75,7 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
         swiftPackageManagerLock: SwiftPackageManagerLock = SwiftPackageManagerLock(),
         swiftPackageManagerScratchDirectoryLocator: SwiftPackageManagerScratchDirectoryLocator =
             SwiftPackageManagerScratchDirectoryLocator(),
-        environment: @escaping () -> [String: String] = { Environment.current.variables }
+        environment: @escaping () -> Environmenting = { Environment.current }
     ) {
         self.swiftPackageManagerController = swiftPackageManagerController
         self.packageInfoMapper = packageInfoMapper
@@ -328,7 +328,7 @@ public struct SwiftPackageManagerGraphLoader: SwiftPackageManagerGraphLoading {
         try swiftPackageManagerScratchDirectoryLocator.locate(
             packagePath: packagePath,
             arguments: arguments,
-            environment: environment(),
+            environment: environment().variables,
             workingDirectory: try await Environment.current.currentWorkingDirectory()
         )
     }
